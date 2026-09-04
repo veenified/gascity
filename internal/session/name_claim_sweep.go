@@ -8,9 +8,9 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 )
 
-// ReleaseStaleConfiguredNameClaims clears the reserved runtime session_name held
-// by CLOSED session beads whose name is a configured named-session runtime name,
-// returning the number of claims released. It is intended to run once at
+// ReleaseStaleConfiguredNameClaims clears reserving identifiers held by CLOSED
+// session beads whose name is a configured named-session runtime name, returning
+// the number of claims released. It is intended to run once at
 // controller/supervisor startup so a freshly started process does not inherit
 // pre-fix stuck name claims (ga-n2d Gap C).
 //
@@ -24,10 +24,10 @@ import (
 //
 // Only CLOSED beads are swept. A live or asleep bead may still legitimately own
 // or resume its reserved name, so its claim is left untouched. A closed bead's
-// claim is released only when its reserved session_name matches a configured
-// named-session runtime name AND the bead is recognized as that configured named
-// session — by the boolean flag, the recorded identity, or a legacy
-// alias/agent_name/template signal that resolves to the configured identity.
+// claim is released when its reserved session_name matches a configured runtime
+// name and its identity signals match that owner. Rows whose runtime name was
+// already cleared are repaired only when their remaining signals resolve to one
+// unambiguous configured identity.
 func ReleaseStaleConfiguredNameClaims(store beads.Store, cfg *config.City, cityName string) (int, error) {
 	if store == nil || cfg == nil {
 		return 0, nil
@@ -66,12 +66,26 @@ func ReleaseStaleConfiguredNameClaims(store beads.Store, cfg *config.City, cityN
 			continue
 		}
 		name := strings.TrimSpace(b.Metadata["session_name"])
-		if name == "" {
-			continue
-		}
-		identity, ok := runtimeToIdentity[name]
-		if !ok {
-			continue
+		identity := ""
+		if name != "" {
+			identity = runtimeToIdentity[name]
+			if identity == "" {
+				continue
+			}
+		} else {
+			ambiguous := false
+			for _, candidate := range runtimeToIdentity {
+				if configuredNamedIdentitySignalsMatch(b, candidate) {
+					if identity != "" && identity != candidate {
+						ambiguous = true
+						break
+					}
+					identity = candidate
+				}
+			}
+			if ambiguous || identity == "" {
+				continue
+			}
 		}
 		// Confirm the closed bead belongs to the configured named session that
 		// OWNS this runtime name before releasing the claim, so an unrelated bead
@@ -92,7 +106,9 @@ func ReleaseStaleConfiguredNameClaims(store beads.Store, cfg *config.City, cityN
 		if !configuredNamedIdentitySignalsMatch(b, identity) {
 			continue
 		}
-		update := beads.UpdateOpts{Metadata: map[string]string{"session_name": ""}}
+		metadata := MetadataPatch(UpdatedAliasMetadata(b.Metadata, ""))
+		releaseConfiguredNamedIdentity(metadata)
+		update := beads.UpdateOpts{Metadata: map[string]string(metadata)}
 		if err := store.Update(b.ID, update); err != nil {
 			return released, fmt.Errorf("releasing stale name claim on %s: %w", b.ID, err)
 		}

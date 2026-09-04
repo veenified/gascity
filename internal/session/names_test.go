@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -640,20 +641,30 @@ func TestWithCitySessionNameLock_EmptyCityPathFallsBackWithoutLockFile(t *testin
 func TestWithCitySessionNameLock_HashesUntrustedIdentifier(t *testing.T) {
 	cityPath := t.TempDir()
 	identifier := "../escape"
+	lockDir := citylayout.SessionNameLocksDir(cityPath)
+	var name string
 
-	if err := WithCitySessionNameLock(cityPath, identifier, func() error { return nil }); err != nil {
+	if err := WithCitySessionNameLock(cityPath, identifier, func() error {
+		entries, err := os.ReadDir(lockDir)
+		if err != nil {
+			return err
+		}
+		if len(entries) != 1 {
+			t.Fatalf("lock files while held = %d, want 1", len(entries))
+		}
+		name = entries[0].Name()
+		return nil
+	}); err != nil {
 		t.Fatalf("WithCitySessionNameLock: %v", err)
 	}
 
-	lockDir := citylayout.SessionNameLocksDir(cityPath)
 	entries, err := os.ReadDir(lockDir)
 	if err != nil {
 		t.Fatalf("ReadDir(%q): %v", lockDir, err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("lock files = %d, want 1", len(entries))
+	if len(entries) != 0 {
+		t.Fatalf("lock files after release = %d, want 0", len(entries))
 	}
-	name := entries[0].Name()
 	if strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) {
 		t.Fatalf("lock file name = %q, want hashed file name without path tokens", name)
 	}
@@ -1143,6 +1154,73 @@ func TestWithCitySessionLocks_EmptyCityPathSharesIdentifierNamespace(t *testing.
 		t.Fatalf("WithCitySessionNameLock: %v", err)
 	}
 	<-acquired
+}
+
+func TestWithCitySessionNameLockRemovesArtifactAfterRelease(t *testing.T) {
+	cityPath := t.TempDir()
+	for i := 0; i < 5; i++ {
+		if err := WithCitySessionNameLock(cityPath, "mayor", func() error { return nil }); err != nil {
+			t.Fatalf("WithCitySessionNameLock cycle %d: %v", i, err)
+		}
+	}
+	entries, err := os.ReadDir(citylayout.SessionNameLocksDir(cityPath))
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("lock directory contains %d artifact(s), want none: %v", len(entries), entries)
+	}
+}
+
+func TestCleanupCitySessionIdentifierLocksRemovesOnlyStaleLockArtifacts(t *testing.T) {
+	cityPath := t.TempDir()
+	dir := citylayout.SessionNameLocksDir(cityPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	stale := filepath.Join(dir, sessionIdentifierLockFileName("mayor")+".lock")
+	if err := os.WriteFile(stale, nil, 0o600); err != nil {
+		t.Fatalf("WriteFile(stale): %v", err)
+	}
+	unrelated := filepath.Join(dir, "keep.txt")
+	if err := os.WriteFile(unrelated, nil, 0o600); err != nil {
+		t.Fatalf("WriteFile(unrelated): %v", err)
+	}
+
+	removed, err := CleanupCitySessionIdentifierLocks(cityPath)
+	if err != nil {
+		t.Fatalf("CleanupCitySessionIdentifierLocks: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale lock stat error = %v, want not-exist", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Fatalf("unrelated file was removed: %v", err)
+	}
+
+	busy := filepath.Join(dir, sessionIdentifierLockFileName("witness")+".lock")
+	f, err := os.OpenFile(busy, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("OpenFile(busy): %v", err)
+	}
+	defer f.Close() //nolint:errcheck
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatalf("Flock(busy): %v", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
+	removed, err = CleanupCitySessionIdentifierLocks(cityPath)
+	if err != nil {
+		t.Fatalf("CleanupCitySessionIdentifierLocks(busy): %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("removed while busy = %d, want 0", removed)
+	}
+	if _, err := os.Stat(busy); err != nil {
+		t.Fatalf("busy lock was removed: %v", err)
+	}
 }
 
 // An open, asleep, drained configured-named-session bead squats the canonical

@@ -1414,6 +1414,11 @@ func runController(
 			fmt.Fprintf(stderr, "controller: released %d stale configured name claim(s) at startup\n", released) //nolint:errcheck // best-effort stderr
 		}
 	}
+	if removed, err := sessionpkg.CleanupCitySessionIdentifierLocks(cityPath); err != nil {
+		fmt.Fprintf(stderr, "controller: stale session-identifier lock sweep: %v\n", err) //nolint:errcheck // best-effort stderr
+	} else if removed > 0 {
+		fmt.Fprintf(stderr, "controller: removed %d stale session-identifier lock artifact(s) at startup\n", removed) //nolint:errcheck // best-effort stderr
+	}
 
 	cs.startBeadEventWatcher(ctx)
 	cs.startEmergencyEventRelay(ctx)

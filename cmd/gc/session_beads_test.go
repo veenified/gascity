@@ -2682,10 +2682,10 @@ func TestSyncSessionBeads_RecreatesDriftedNamedSessionRuntimeName(t *testing.T) 
 		openNew   beads.Bead
 	)
 	for _, b := range all {
-		switch strings.TrimSpace(b.Metadata["session_name"]) {
-		case oldName:
+		switch {
+		case b.Status == "closed" && strings.TrimSpace(b.Metadata[namedSessionIdentityMetadata]) == identity:
 			closedOld = b
-		case expectedName:
+		case strings.TrimSpace(b.Metadata["session_name"]) == expectedName:
 			openNew = b
 		}
 	}

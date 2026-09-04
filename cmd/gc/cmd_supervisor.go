@@ -2255,6 +2255,14 @@ func startOneCity(
 		}
 		return nil
 	})
+	_ = runPostPrepareStep("removing_stale_session_identifier_locks", func() error {
+		if removed, err := sessionpkg.CleanupCitySessionIdentifierLocks(path); err != nil {
+			fmt.Fprintf(stderr, "gc supervisor: city '%s': stale session-identifier lock sweep: %v\n", cityName, err) //nolint:errcheck
+		} else if removed > 0 {
+			fmt.Fprintf(stderr, "gc supervisor: city '%s': removed %d stale session-identifier lock artifact(s) at startup\n", cityName, removed) //nolint:errcheck
+		}
+		return nil
+	})
 
 	_ = runPostPrepareStep("starting_bead_event_watcher", func() error {
 		cs.startBeadEventWatcher(cityCtx)

@@ -301,16 +301,132 @@ func withCitySessionIdentifierLock(cityPath, identifier string, fn func() error)
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return fmt.Errorf("creating session identifier lock dir: %w", err)
 	}
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	for {
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return fmt.Errorf("opening session identifier lock: %w", err)
+		}
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("locking session identifier %q: %w", identifier, err)
+		}
+
+		current, err := lockFileIsCurrent(f, lockPath)
+		if err != nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			return fmt.Errorf("checking session identifier lock %q: %w", identifier, err)
+		}
+		if !current {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			continue
+		}
+
+		fnErr := fn()
+		removeErr := removeCurrentLockFile(f, lockPath)
+		unlockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		closeErr := f.Close()
+		if fnErr != nil {
+			return fnErr
+		}
+		if removeErr != nil {
+			return fmt.Errorf("removing session identifier lock %q: %w", identifier, removeErr)
+		}
+		if unlockErr != nil {
+			return fmt.Errorf("unlocking session identifier %q: %w", identifier, unlockErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("closing session identifier lock %q: %w", identifier, closeErr)
+		}
+		return nil
+	}
+}
+
+func lockFileIsCurrent(f *os.File, path string) (bool, error) {
+	opened, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("opening session identifier lock: %w", err)
+		return false, err
 	}
-	defer f.Close() //nolint:errcheck // best-effort cleanup
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("locking session identifier %q: %w", identifier, err)
+	linked, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
 	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck // best-effort unlock
-	return fn()
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(opened, linked), nil
+}
+
+func removeCurrentLockFile(f *os.File, path string) error {
+	current, err := lockFileIsCurrent(f, path)
+	if err != nil || !current {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// CleanupCitySessionIdentifierLocks removes unlocked lock artifacts left by an
+// older process. Busy files are preserved; every active holder removes its own
+// artifact when releasing the lock.
+func CleanupCitySessionIdentifierLocks(cityPath string) (int, error) {
+	if strings.TrimSpace(cityPath) == "" {
+		return 0, nil
+	}
+	dir := citylayout.SessionNameLocksDir(cityPath)
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("reading session identifier lock dir: %w", err)
+	}
+	removed := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !isSessionIdentifierLockFile(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		f, openErr := os.OpenFile(path, os.O_RDWR, 0o600)
+		if errors.Is(openErr, os.ErrNotExist) {
+			continue
+		}
+		if openErr != nil {
+			return removed, fmt.Errorf("opening stale session identifier lock: %w", openErr)
+		}
+		lockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if lockErr != nil {
+			_ = f.Close()
+			if errors.Is(lockErr, syscall.EWOULDBLOCK) {
+				continue
+			}
+			return removed, fmt.Errorf("locking stale session identifier artifact: %w", lockErr)
+		}
+		if err := removeCurrentLockFile(f, path); err != nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			return removed, fmt.Errorf("removing stale session identifier artifact: %w", err)
+		}
+		removed++
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}
+	return removed, nil
+}
+
+func isSessionIdentifierLockFile(name string) bool {
+	if filepath.Ext(name) != ".lock" {
+		return false
+	}
+	raw := strings.TrimSuffix(name, ".lock")
+	if len(raw) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(raw)
+	return err == nil
 }
 
 func sessionIdentifierLockFileName(identifier string) string {

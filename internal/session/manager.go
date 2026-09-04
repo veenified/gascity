@@ -1389,22 +1389,11 @@ func (m *Manager) retireConfiguredNamedSessionIdentifiers(id string, b beads.Bea
 	// partially-tagged bead (identity recorded, boolean flag absent) still
 	// releases its reserved runtime name on close instead of stranding the
 	// name and blocking respawn (ga-841).
-	if !wasConfiguredNamedSession(b) {
+	patch := configuredNamedIdentityReleasePatch(b)
+	if len(patch) == 0 {
 		return nil
 	}
-	update := beads.UpdateOpts{
-		Metadata: UpdatedAliasMetadata(b.Metadata, ""),
-	}
-	update.Metadata["session_name"] = ""
-	update.Metadata["session_name_explicit"] = ""
-	update.Metadata["pending_create_claim"] = ""
-	update.Metadata["pending_create_started_at"] = ""
-	// Free the durable canonical-identity record on this close path too, matching
-	// RetireNamedSessionPatch. Without it a configured named session closed via
-	// Manager.Close keeps a stale canonical instance name / pool slot — the same
-	// strand class the S19 retirement fix removed for the duplicate/removed/API
-	// paths, which this hand-rolled path is not one of.
-	freeCanonicalIdentityMetadata(update.Metadata)
+	update := beads.UpdateOpts{Metadata: map[string]string(patch)}
 	if err := m.store.Update(id, update); err != nil {
 		return fmt.Errorf("retiring configured named session identifiers: %w", err)
 	}

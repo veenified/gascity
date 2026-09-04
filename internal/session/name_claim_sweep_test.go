@@ -79,9 +79,15 @@ func TestReleaseStaleConfiguredNameClaims_ReleasesClosedFlaggedClaim(t *testing.
 		Type:   BeadType,
 		Labels: []string{LabelSession},
 		Metadata: map[string]string{
-			"session_name":              runtimeName,
-			"configured_named_session":  "true",
-			"configured_named_identity": "gastown.refinery",
+			"session_name":                runtimeName,
+			"session_name_explicit":       "true",
+			"alias":                       "gastown.refinery",
+			"configured_named_session":    "true",
+			"configured_named_identity":   "gastown.refinery",
+			"pending_create_claim":        "true",
+			"pending_create_started_at":   "2026-06-01T11:59:00Z",
+			CanonicalInstanceNameMetadata: "gastown.refinery",
+			CanonicalPoolSlotMetadata:     "1",
 		},
 	})
 	if err != nil {
@@ -97,6 +103,60 @@ func TestReleaseStaleConfiguredNameClaims_ReleasesClosedFlaggedClaim(t *testing.
 	}
 	if released != 1 {
 		t.Fatalf("released = %d, want 1", released)
+	}
+	got, err := store.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	for _, key := range []string{
+		"alias",
+		"session_name",
+		"session_name_explicit",
+		"pending_create_claim",
+		"pending_create_started_at",
+		CanonicalInstanceNameMetadata,
+		CanonicalPoolSlotMetadata,
+	} {
+		if got.Metadata[key] != "" {
+			t.Errorf("metadata[%q] = %q, want empty", key, got.Metadata[key])
+		}
+	}
+}
+
+func TestReleaseStaleConfiguredNameClaims_ReleasesIdentityWithoutRuntimeName(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := staleClaimSweepConfig()
+	bead, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"alias":                       "gastown.refinery",
+			"configured_named_session":    "true",
+			"configured_named_identity":   "gastown.refinery",
+			CanonicalInstanceNameMetadata: "gastown.refinery",
+			CanonicalPoolSlotMetadata:     "1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.Close(bead.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	released, err := ReleaseStaleConfiguredNameClaims(store, cfg, "test-city")
+	if err != nil {
+		t.Fatalf("ReleaseStaleConfiguredNameClaims: %v", err)
+	}
+	if released != 1 {
+		t.Fatalf("released = %d, want 1", released)
+	}
+	got, err := store.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Metadata["alias"] != "" || got.Metadata[CanonicalInstanceNameMetadata] != "" || got.Metadata[CanonicalPoolSlotMetadata] != "" {
+		t.Fatalf("stale identity was not cleared: %v", got.Metadata)
 	}
 }
 

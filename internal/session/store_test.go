@@ -2,14 +2,30 @@ package session
 
 import (
 	"errors"
+	"os"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/beadstest"
+	"github.com/gastownhall/gascity/internal/citylayout"
 )
+
+type instanceChangeOnCloseStore struct {
+	beads.Store
+	once sync.Once
+}
+
+func (s *instanceChangeOnCloseStore) CloseWithMetadataIfMatch(id string, expectedRevision int64, metadata map[string]string) (beads.Bead, error) {
+	s.once.Do(func() {
+		_ = s.SetMetadata(id, "instance_token", "instance-b")
+	})
+	closer, _ := beads.AtomicConditionalCloserFor(s.Store)
+	return closer.CloseWithMetadataIfMatch(id, expectedRevision, metadata)
+}
 
 // recordingStore seeds a session bead into a recording-fake store and
 // returns the Store front door plus the recorder, so a test can assert the
@@ -278,6 +294,115 @@ func TestCloseAlreadyClosedIsNoOp(t *testing.T) {
 	}
 	if got := len(rec.Calls()); got != 0 {
 		t.Errorf("Close on closed bead emitted %d writes, want 0", got)
+	}
+}
+
+func TestCloseReleasesConfiguredNamedSessionIdentity(t *testing.T) {
+	store := beads.NewAtomicCloseMemStore()
+	created, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"state":                       "asleep",
+			"alias":                       "mayor",
+			"session_name":                "test-city-mayor",
+			"session_name_explicit":       "true",
+			"configured_named_session":    "true",
+			"configured_named_identity":   "gastown.mayor",
+			"pending_create_claim":        "true",
+			"pending_create_started_at":   "2026-06-01T11:59:00Z",
+			CanonicalInstanceNameMetadata: "gastown.mayor",
+			CanonicalPoolSlotMetadata:     "1",
+			"instance_token":              "instance-a",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	cityPath := t.TempDir()
+	closed, err := NewStore(beads.SessionStore{Store: store}).CloseCurrent(cityPath, created.ID, "instance-a", "drained", time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !closed {
+		t.Fatal("Close reported not-closed for an open named session")
+	}
+	got, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("status = %q, want closed", got.Status)
+	}
+	for _, key := range []string{
+		"alias",
+		"session_name",
+		"session_name_explicit",
+		"pending_create_claim",
+		"pending_create_started_at",
+		CanonicalInstanceNameMetadata,
+		CanonicalPoolSlotMetadata,
+	} {
+		if got.Metadata[key] != "" {
+			t.Errorf("metadata[%q] = %q, want empty", key, got.Metadata[key])
+		}
+	}
+	entries, err := os.ReadDir(citylayout.SessionNameLocksDir(cityPath))
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("lock directory contains %d artifact(s), want none: %v", len(entries), entries)
+	}
+	if err := EnsureAliasAvailable(store, "mayor", ""); err != nil {
+		t.Fatalf("released alias is unavailable to successor: %v", err)
+	}
+	if err := EnsureSessionNameAvailableWithConfig(store, nil, "test-city-mayor", ""); err != nil {
+		t.Fatalf("released runtime name is unavailable to successor: %v", err)
+	}
+	closed, err = NewStore(beads.SessionStore{Store: store}).CloseCurrent(cityPath, created.ID, "instance-a", "drained", time.Now())
+	if err != nil {
+		t.Fatalf("idempotent CloseCurrent: %v", err)
+	}
+	if closed {
+		t.Fatal("idempotent CloseCurrent reported a second close")
+	}
+}
+
+func TestCloseCurrentDoesNotClearIdentityAfterInstanceChanges(t *testing.T) {
+	store := &instanceChangeOnCloseStore{Store: beads.NewAtomicCloseMemStore()}
+	created, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"state":                    "active",
+			"instance_token":           "instance-a",
+			"session_name":             "test-city-mayor",
+			"alias":                    "mayor",
+			"configured_named_session": "true",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	closed, err := NewStore(beads.SessionStore{Store: store}).CloseCurrent(t.TempDir(), created.ID, "instance-a", "drained", time.Now())
+	if !errors.Is(err, ErrSessionInstanceChanged) {
+		t.Fatalf("CloseCurrent error = %v, want ErrSessionInstanceChanged", err)
+	}
+	if closed {
+		t.Fatal("CloseCurrent closed a different session instance")
+	}
+	got, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status == "closed" || got.Metadata["alias"] != "mayor" || got.Metadata["session_name"] != "test-city-mayor" {
+		t.Fatalf("different instance was mutated: status=%q metadata=%v", got.Status, got.Metadata)
+	}
+	if got.Metadata["instance_token"] != "instance-b" {
+		t.Fatalf("instance_token = %q, want replacement instance-b", got.Metadata["instance_token"])
 	}
 }
 

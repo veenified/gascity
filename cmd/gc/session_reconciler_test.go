@@ -3668,6 +3668,48 @@ func TestFinalizeDrainAckStoppedSessionFallsThroughWhenCloseGateRacesWithAssignm
 	}
 }
 
+func TestFinalizeDrainAckStoppedSessionReleasesNamedIdentity(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "mayor"}}}
+	session := env.createSessionBead("test-city-mayor", "mayor")
+	if err := env.store.SetMetadataBatch(session.ID, map[string]string{
+		"alias":                                  "mayor",
+		"session_name_explicit":                  "true",
+		"configured_named_session":               "true",
+		"configured_named_identity":              "gastown.mayor",
+		sessionpkg.CanonicalInstanceNameMetadata: "gastown.mayor",
+		sessionpkg.CanonicalPoolSlotMetadata:     "1",
+	}); err != nil {
+		t.Fatalf("SetMetadataBatch(named identity): %v", err)
+	}
+
+	result := finalizeDrainAckStoppedSession(
+		t.TempDir(), env.cfg, env.store, nil, env.sessionInfo(session.ID), "mayor", true,
+		newFakeDrainOps(), env.dt, env.clk, env.rec, &env.stderr,
+	)
+	if !result.closed {
+		t.Fatalf("finalize result = %#v, want closed", result)
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("status = %q, want closed", got.Status)
+	}
+	for _, key := range []string{
+		"alias",
+		"session_name",
+		"session_name_explicit",
+		sessionpkg.CanonicalInstanceNameMetadata,
+		sessionpkg.CanonicalPoolSlotMetadata,
+	} {
+		if got.Metadata[key] != "" {
+			t.Errorf("metadata[%q] = %q, want empty", key, got.Metadata[key])
+		}
+	}
+}
+
 // TestReconcileSessionBeads_DrainAckLiveStoreErrorFailsClosed guards the
 // drain-ack live-query error path. When sessionHasOpenAssignedWork returns
 // an error, drain-ack treats hasAssignedWork as true (fail-closed) so the

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -9,6 +10,10 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 )
+
+// ErrSessionInstanceChanged reports that a terminal action was prepared for a
+// different incarnation than the session bead currently represents.
+var ErrSessionInstanceChanged = errors.New("session instance changed")
 
 // This file extends the session-class domain wrapper (Store) with the
 // WRITE half of the front door per OBJECT-MODEL-FRONT-DOOR-DESIGN sec 3.1. The
@@ -330,30 +335,127 @@ func (s *Store) GetState(id string) (state State, closed bool, err error) {
 	return info.State, info.Closed, nil
 }
 
-// Close closes the session bead with terminal close metadata via ClosePatch,
-// then sets status closed. It is the front door for closeBead /
-// closeFailedCreateBead. stateCode is the canonical short state code recorded
-// before close; ClosePatch expands it to a validator-safe close_reason.
+const terminalCloseMaxAttempts = 3
+
+// Close closes the currently observed session incarnation. Configured named
+// sessions release their reserving identifiers in the same terminal patch.
 //
 // Reports whether the bead was actually closed (false when it was already
 // closed). PHASE 0: the work-reassignment side effect that closeBead performs
 // (releaseWorkFromClosedSessionBead) is intentionally NOT part of this method —
 // that is a cross-class WORK op owned by the Phase 6 work/assignment API.
 func (s *Store) Close(id, stateCode string, now time.Time) (bool, error) {
-	info, err := s.Get(id)
+	bead, err := s.validatedBead(id)
 	if err != nil {
 		return false, err
 	}
-	if info.Closed {
+	if bead.Status == "closed" {
 		return false, nil
 	}
-	if err := s.ApplyPatch(id, ClosePatch(now, stateCode)); err != nil {
+	if _, atomic := beads.AtomicConditionalCloserFor(s.store); atomic {
+		return s.CloseCurrent("", id, bead.Metadata["instance_token"], stateCode, now)
+	}
+	if err := s.ApplyPatch(id, TerminalClosePatch(bead, now, stateCode)); err != nil {
 		return false, err
 	}
 	if err := s.store.Close(id); err != nil {
 		return false, fmt.Errorf("closing session %q: %w", id, err)
 	}
 	return true, nil
+}
+
+// CloseCurrent closes id only while its instance token still matches the
+// caller's observation. City-scoped identifier locks serialize the release
+// with successor claims; revision-capable stores also commit terminal metadata
+// and status as one fenced write.
+func (s *Store) CloseCurrent(cityPath, id, expectedInstanceToken, stateCode string, now time.Time) (bool, error) {
+	bead, err := s.validatedBead(id)
+	if err != nil {
+		return false, err
+	}
+	if bead.Status == "closed" {
+		return false, nil
+	}
+	if !sameSessionInstance(bead, expectedInstanceToken) {
+		return false, fmt.Errorf("%w: %s", ErrSessionInstanceChanged, id)
+	}
+
+	identifiers := terminalCloseIdentifiers(bead)
+	var closed bool
+	err = WithCitySessionIdentifierLocks(cityPath, identifiers, func() error {
+		current, loadErr := s.validatedBead(id)
+		if loadErr != nil {
+			return loadErr
+		}
+		if current.Status == "closed" {
+			return nil
+		}
+		if !sameSessionInstance(current, expectedInstanceToken) {
+			return fmt.Errorf("%w: %s", ErrSessionInstanceChanged, id)
+		}
+		closed, loadErr = s.closeCurrentBead(current, expectedInstanceToken, stateCode, now)
+		return loadErr
+	})
+	return closed, err
+}
+
+func (s *Store) closeCurrentBead(bead beads.Bead, expectedInstanceToken, stateCode string, now time.Time) (bool, error) {
+	closer, atomic := beads.AtomicConditionalCloserFor(s.store)
+	if !atomic {
+		if err := s.store.Tx("gc: close session "+bead.ID, func(tx beads.Tx) error {
+			if err := tx.SetMetadataBatch(bead.ID, TerminalClosePatch(bead, now, stateCode)); err != nil {
+				return err
+			}
+			return tx.Close(bead.ID)
+		}); err != nil {
+			return false, fmt.Errorf("closing session %q: %w", bead.ID, err)
+		}
+		return true, nil
+	}
+
+	var conflict error
+	for attempt := 1; attempt <= terminalCloseMaxAttempts; attempt++ {
+		patch := TerminalClosePatch(bead, now, stateCode)
+		_, closeErr := closer.CloseWithMetadataIfMatch(bead.ID, bead.Revision, map[string]string(patch))
+		if closeErr == nil {
+			return true, nil
+		}
+		if !beads.IsPreconditionFailed(closeErr) {
+			return false, fmt.Errorf("closing session %q atomically: %w", bead.ID, closeErr)
+		}
+		conflict = closeErr
+		if attempt == terminalCloseMaxAttempts {
+			break
+		}
+		current, err := s.validatedBead(bead.ID)
+		if err != nil {
+			return false, err
+		}
+		if current.Status == "closed" {
+			return false, nil
+		}
+		if !sameSessionInstance(current, expectedInstanceToken) {
+			return false, fmt.Errorf("%w: %s", ErrSessionInstanceChanged, bead.ID)
+		}
+		bead = current
+	}
+	return false, fmt.Errorf("closing session %q atomically after %d revision conflicts: %w", bead.ID, terminalCloseMaxAttempts, conflict)
+}
+
+func sameSessionInstance(bead beads.Bead, expected string) bool {
+	return strings.TrimSpace(bead.Metadata["instance_token"]) == strings.TrimSpace(expected)
+}
+
+func terminalCloseIdentifiers(bead beads.Bead) []string {
+	if !wasConfiguredNamedSession(bead) {
+		return nil
+	}
+	return []string{
+		bead.Metadata["session_name"],
+		bead.Metadata["alias"],
+		bead.Metadata[NamedSessionIdentityMetadata],
+		bead.Metadata[CanonicalInstanceNameMetadata],
+	}
 }
 
 // SetStatusOpen sets the session bead status to "open". It is the front door

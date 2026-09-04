@@ -4,7 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/beads"
 )
 
 // Priming markers record that a session's launch path attempted delivery of
@@ -551,6 +554,49 @@ func ClosePatch(now time.Time, stateCode string) MetadataPatch {
 		"closed_at":    ts,
 		"synced_at":    ts,
 	}
+}
+
+// TerminalClosePatch extends ClosePatch with the ownership releases required
+// when a configured named session becomes terminal. The configured identity
+// markers remain as historical classification; only identifiers that can block
+// a successor are cleared.
+func TerminalClosePatch(b beads.Bead, now time.Time, stateCode string) MetadataPatch {
+	patch := ClosePatch(now, stateCode)
+	for key, value := range configuredNamedIdentityReleasePatch(b) {
+		patch[key] = value
+	}
+	return patch
+}
+
+// TerminalClosePatchFromInfo is the typed-projection form of
+// TerminalClosePatch for callers that already hold a coherent Info snapshot.
+func TerminalClosePatchFromInfo(info Info, now time.Time, stateCode string) MetadataPatch {
+	patch := ClosePatch(now, stateCode)
+	if !info.ConfiguredNamedSession && strings.TrimSpace(info.ConfiguredNamedIdentity) == "" {
+		return patch
+	}
+	for key, value := range UpdatedAliasMetadataFromInfo(info, "") {
+		patch[key] = value
+	}
+	releaseConfiguredNamedIdentity(patch)
+	return patch
+}
+
+func releaseConfiguredNamedIdentity(patch MetadataPatch) {
+	patch["session_name"] = ""
+	patch["session_name_explicit"] = ""
+	patch["pending_create_claim"] = ""
+	patch["pending_create_started_at"] = ""
+	freeCanonicalIdentityMetadata(patch)
+}
+
+func configuredNamedIdentityReleasePatch(b beads.Bead) MetadataPatch {
+	if !wasConfiguredNamedSession(b) {
+		return nil
+	}
+	patch := MetadataPatch(UpdatedAliasMetadata(b.Metadata, ""))
+	releaseConfiguredNamedIdentity(patch)
+	return patch
 }
 
 // CanonicalCloseReason maps a short session stateCode to a human-readable

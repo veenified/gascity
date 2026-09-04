@@ -1497,7 +1497,7 @@ func repairStrandedPoolWorkerBead(
 		fmt.Fprintf(stderr, "session beads: stranded-repair for %s deferred: %d of %d unassign(s) failed; leaving session bead open for retry\n", info.ID, res.Failed, res.Failed+res.Released) //nolint:errcheck
 		return false
 	}
-	return closeBead(store, info.ID, strandedRepairCloseReason, now, stderr)
+	return closeBeadAtCity(cityPath, store, info.ID, strandedRepairCloseReason, now, stderr)
 }
 
 func reassignStateAssignedToRetiredSessionBead(store beads.Store, oldSessionID, newSessionID string, now time.Time, stderr io.Writer) {
@@ -3265,6 +3265,10 @@ func staleReapStartBoundaryInfo(i session.Info) (time.Time, bool) {
 // pool reconciler can re-pick them. Without this, work orphaned by a
 // reap stays orphaned until someone clears the assignee by hand.
 func closeBead(store beads.Store, id, reason string, now time.Time, stderr io.Writer) bool {
+	return closeBeadAtCity("", store, id, reason, now, stderr)
+}
+
+func closeBeadAtCity(cityPath string, store beads.Store, id, reason string, now time.Time, stderr io.Writer) bool {
 	if stderr == nil {
 		stderr = io.Discard
 	}
@@ -3289,20 +3293,19 @@ func closeBead(store beads.Store, id, reason string, now time.Time, stderr io.Wr
 	if reason == string(session.StateFailedCreate) {
 		return closeFailedCreateBead(sessionFrontDoor(store), id, now, stderr)
 	}
-	// The terminal metadata batch and the Close land inside one Tx. On an
-	// atomic backing (the production Dolt/DoltLite store) a bead that reports
-	// closed always carries its terminal state, never one without the other
-	// (ga-igcny0.1.1). On a non-atomic Tx the metadata (ordered first) may land
-	// while the Close fails; the helper then reports failure and the reconciler
-	// re-runs the close next tick, so no bead is durably left half-closed.
-	txErr := store.Tx("gc: close session "+id, func(tx beads.Tx) error {
-		if err := tx.SetMetadataBatch(id, session.ClosePatch(now, reason)); err != nil {
-			return err
-		}
-		return tx.Close(id)
-	})
-	if txErr != nil {
-		fmt.Fprintf(stderr, "session beads: closing %s: %v\n", id, txErr) //nolint:errcheck
+	front := sessionFrontDoor(store)
+	var closed bool
+	var closeErr error
+	if snapshotErr == nil {
+		closed, closeErr = front.CloseCurrent(cityPath, id, snapshot.Metadata["instance_token"], reason, now)
+	} else {
+		closed, closeErr = front.Close(id, reason, now)
+	}
+	if closeErr != nil {
+		fmt.Fprintf(stderr, "session beads: closing %s: %v\n", id, closeErr) //nolint:errcheck
+		return false
+	}
+	if !closed {
 		return false
 	}
 	// Cascade extmsg cleanup. Pool retirement funnels through closeBead;

@@ -632,7 +632,7 @@ func finalizeDrainAckStoppedSession(
 	}
 	if closeIfUnassigned && !hasAssignedWork {
 		if closeSessionBeadIfReachableStoreUnassigned(cityPath, cfg, store, rigStores, info, "drained", clk.Now().UTC(), stderr, true) {
-			closePatch := sessionpkg.ClosePatch(clk.Now().UTC(), "drained")
+			closePatch := sessionpkg.TerminalClosePatchFromInfo(info, clk.Now().UTC(), "drained")
 			if dops != nil {
 				_ = dops.clearDrain(name)
 			}
@@ -647,7 +647,8 @@ func finalizeDrainAckStoppedSession(
 			// close reader now, and the telemetry close-path test re-pins on it.
 			return drainAckFinalizeResult{batch: closePatch, closed: true}
 		}
-		if witnessInfo, err := sessionFrontDoor(store).Get(info.ID); err == nil && witnessInfo.Closed {
+		witnessInfo, witnessErr := sessionFrontDoor(store).Get(info.ID)
+		if witnessErr == nil && witnessInfo.Closed {
 			// NDI witness close: another observer already closed the bead. The
 			// session-front-door Get returns the authoritative closed Info directly —
 			// the one documented status-close Store.Get refresh (a metadata patch
@@ -670,6 +671,9 @@ func finalizeDrainAckStoppedSession(
 			}
 			recordStopped(false)
 			return drainAckFinalizeResult{witnessInfo: &witnessInfo}
+		}
+		if witnessErr == nil && strings.TrimSpace(witnessInfo.InstanceToken) != strings.TrimSpace(info.InstanceToken) {
+			return drainAckFinalizeResult{}
 		}
 		assignedAfterCloseGate, closeGateAssignedErr := sessionHasOpenAssignedWorkForReachableStoreForCloseGate(cityPath, cfg, store, rigStores, info)
 		if closeGateAssignedErr != nil {
@@ -3984,7 +3988,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			if closeReason == "" {
 				closeReason = "drained"
 			}
-			if closeBead(store, target.info.ID, closeReason, clk.Now().UTC(), stderr) {
+			if closeBeadAtCity(cityPath, store, target.info.ID, closeReason, clk.Now().UTC(), stderr) {
 				// Store-only close family: mirror the close onto the snapshot
 				// (write-returns-Info) so a later reader sees Closed=true.
 				tick.markClosed(target.info.ID)
